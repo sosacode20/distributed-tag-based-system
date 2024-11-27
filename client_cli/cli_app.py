@@ -1,6 +1,7 @@
 # import click
 from cyclopts import App, Parameter
-from actions.send_file import send_file
+
+# from actions.send_file import send_file
 from pathlib import Path
 from rich.console import Console
 from rich.text import Text
@@ -55,8 +56,8 @@ def validate_tags(tags: list[str]) -> bool:
 # endregion
 
 
-@app.command
-def add_files(
+@app.command(name="add")
+def upload_files(
     files: Annotated[
         list[Path],
         Parameter(name=["--files", "-f"], consume_multiple=True),
@@ -75,6 +76,23 @@ def add_files(
     if not validate_tags(tags):
         return
     console.print("Files where sent successfully", style="green")
+
+@app.command(name="add-file")
+def upload_single_file(
+    file: Annotated[
+        Path,
+        Parameter(name=["--file", "-f"]),
+    ],
+    tags: Annotated[
+        list[str],
+        Parameter(name=["--tags", "-t"], consume_multiple=True),
+    ],
+):
+    if not validate_files([file]):
+        return
+    if not validate_tags(tags):
+        return
+    # TODO: Finish
 
 
 @app.command
