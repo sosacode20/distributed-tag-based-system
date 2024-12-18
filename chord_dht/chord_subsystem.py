@@ -273,7 +273,7 @@ class ChordNode:
                     len(message) >= 3
                 ), "Chord subsystem expects at least 3 parts in a message (id, subsystem, operation)"
 
-                id, subsystem, operation, *body = message
+                client_address, subsystem, operation, *body = message
                 assert (
                     subsystem == CHORD_SUBSYSTEM
                 ), f"The first part of the message MUST be `{CHORD_SUBSYSTEM.decode()}` but it was received `{subsystem.decode()}`"
@@ -317,7 +317,7 @@ class ChordNode:
 
                 if response:
                     # Handle how to send the response to the upper layer system
-                    self.server_socket.send_multipart(response)
+                    self.server_socket.send_multipart([client_address] + response)
 
             except Exception as e:
                 print(
