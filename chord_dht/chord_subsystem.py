@@ -3,6 +3,8 @@ import hashlib
 from typing import Optional, Self
 from rich import print
 from rich.text import Text
+import threading
+import time
 
 # Operation codes
 CHORD_SUBSYSTEM = b"Chord"
@@ -29,44 +31,104 @@ def get_id_of_node(ip: str, port: int) -> int:
 
 
 class ChordNodeReference:
-    def __init__(self, ip: str, port: int = 8001):
+    def __init__(
+        self,
+        ip: str,
+        port: int = 8001,
+        context: Optional[zmq.SyncContext] = None,
+    ):
+        self.context: zmq.SyncContext = (
+            context if context else zmq.SyncContext.instance()
+        )
+        """The zmq context to create sockets"""
         self.id = get_id_of_node(ip, port)
         """The unique ID of this `ChordNodeReference` in the Chord Ring"""
         self.ip: str = ip
         """The IP address of this `ChordNodeReference` in the Ring"""
         self.port: int = port
         """The Port of this `ChordNodeReference` in the Ring"""
+        self.timeout: int = 2500
+        """The timeout of each request in milliseconds"""
 
     def to_zmq_multipart(self) -> list[bytes]:
         """Creates a ZMQ multipart message that represents this node reference"""
         return [self.ip.encode(), self.port.to_bytes()]
 
-    def find_successor(self, id: int) -> Self:
+    def send_data(self, data: list[bytes]) -> Optional[list[bytes]]:
+        """Send data to this `ChordNodeReference and wait for a result.
+        If no results are received after `self.timeout` then None is returned"""
+        socket: zmq.SyncSocket = self.context.socket(zmq.DEALER)
+        socket.setsockopt(zmq.LINGER, 0)
+        response: Optional[list[bytes]] = None
+        try:
+            with socket.connect(f"tcp://{self.ip}:{self.port}") as conn:
+                message = [CHORD_SUBSYSTEM] + data
+                conn.send_multipart(message)
+                items = conn.poll(self.timeout)
+                if items != 0:  # If we receive something
+                    response = conn.recv_multipart()
+        except Exception as e:
+            print(
+                f"An exception occurred in the `send_data` method of `ChordNodeReference` => \n{e}"
+            )
+        socket.close(0)
+        return response
+
+    def find_successor(self, id: int) -> Optional[Self]:
         """Finds the `ChordNodeReference` of the immediate successor of the `id`"""
-        pass
+        response = self.send_data([FIND_SUCCESSOR, id.to_bytes()])
+        if not response:
+            return None
+        ip = response[0].decode()
+        port = int.from_bytes(response[1])
+        return ChordNodeReference(ip, port, self.context)
 
-    def find_predecessor(self, id: int) -> Self:
+    def find_predecessor(self, id: int) -> Optional[Self]:
         """Finds the `ChordNodeReference` of the immediate predecessor of the `id`"""
-        # TODO: Implement
-        pass
+        response = self.send_data([FIND_PREDECESSOR, id.to_bytes()])
+        if not response:
+            return None
+        ip = response[0].decode()
+        port = int.from_bytes(response[1])
+        return ChordNodeReference(ip, port, self.context)
 
     @property
-    def successor(self) -> Self:
+    def successor(self) -> Optional[Self]:
         """Returns the successor of this node"""
-        pass
+        response = self.send_data([GET_SUCCESSOR, id.to_bytes()])
+        if not response:
+            return None
+        ip = response[0].decode()
+        port = int.from_bytes(response[1])
+        return ChordNodeReference(ip, port, self.context)
 
     @property
-    def predecessor(self) -> Self:
+    def predecessor(self) -> Optional[Self]:
         """Returns the predecessor of this node"""
-        pass
+        response = self.send_data([GET_PREDECESSOR, id.to_bytes()])
+        if not response:
+            return None
+        ip = response[0].decode()
+        port = int.from_bytes(response[1])
+        return ChordNodeReference(ip, port, self.context)
 
-    def closest_preceding_finger(self, id: int) -> Self:
+    def closest_preceding_finger(self, id: int) -> Optional[Self]:
         """Find the closest preceding finger preceding the `id`"""
-        pass
+        response = self.send_data([CLOSEST_PRECEDING_FINGER, id.to_bytes()])
+        if not response:
+            return None
+        ip = response[0].decode()
+        port = int.from_bytes(response[1])
+        return ChordNodeReference(ip, port, self.context)
 
     def notify(self, node: Self):
         """This function notify this node about another node that is potentially it's predecessor"""
-        pass
+        self.send_data([NOTIFY] + node.to_zmq_multipart())
+
+    def ping(self) -> bool:
+        """This function makes a ping to the node. It return True if the node is alive"""
+        response = self.send_data([PING])
+        return response is not None
 
 
 class ChordNode:
@@ -106,8 +168,11 @@ class ChordNode:
         """Number of bits in the hash/key space"""
         self.finger = [self.ref] * self.m  # Finger table
         """Finger Table of this `ChordNode`. It includes the actual node as the first reference"""
-        self.next = 0
-        """Finger table index to fix nextdef __init__(self, ip: str, port: int = 8001, m: int = 160):"""
+
+        threading.Thread(target=self.stabilize, daemon=True).start()
+        threading.Thread(target=self.fix_fingers, daemon=True).start()
+        threading.Thread(target=self.start_server, daemon=True).start()
+        threading.Thread(target=self.check_predecessor, daemon=True).start()
 
     def find_successor(self, id: int) -> ChordNodeReference:
         """Finds the `ChordNodeReference` of the immediate successor of the `id`"""
@@ -135,7 +200,9 @@ class ChordNode:
 
     def notify(self, node: ChordNodeReference):
         """This function notify this node about another node that is potentially it's predecessor"""
-        if not self.predecessor or self._in_between(node.id, self.predecessor.id, self.id):
+        if not self.predecessor or self._in_between(
+            node.id, self.predecessor.id, self.id
+        ):
             self.predecessor = node
 
     def closest_preceding_finger(self, id: int) -> ChordNodeReference:
@@ -146,14 +213,54 @@ class ChordNode:
 
     def join(self, node: ChordNodeReference):
         """Join this `ChordNode` to the ring of the given node"""
-        pass
+        if node.id == self.id:
+            return
+        self.predecessor = None
+        self.successor = node.find_successor(self.id)
 
     def stabilize(self):
         """Keep the successor up to date"""
-        pass
+        while True:
+            try:
+                pred = self.successor.predecessor
+                if self.id < pred.id <= self.successor.id:
+                    self.predecessor = pred
+            except Exception as e:
+                print(f"An exception occurred in 'Stabilize' method => \n{e}")
+            time.sleep(1)
 
     def fix_fingers(self):
         """Fix the finger table periodically"""
+        while True:
+            try:
+                for i in range(self.m - 1, -1, -1):
+                    start = (self.id + 2**i) % (2**self.m)
+                    self.finger[i] = self.find_successor(start)
+                    time.sleep(0.05)
+            except Exception as e:
+                print(
+                    f"An error occur in the `fix_fingers` method of the node => \n{e}"
+                )
+            time.sleep(10)
+
+    def check_predecessor(self):
+        """Check for the predecessor"""
+        while True:
+            try:
+                self.predecessor = (
+                    self.predecessor
+                    if self.predecessor and self.predecessor.ping()
+                    else None
+                )
+            except Exception as e:
+                print(
+                    f"An exception has occurred in the `check_predecessor` routine => \n{e}"
+                )
+            time.sleep(1)
+
+    def stop(self):
+        """This method stop the subsystem. Closing all sockets and stopping all threads"""
+        # Implement this
         pass
 
     def start_server(self):
@@ -162,12 +269,14 @@ class ChordNode:
             try:
                 message = self.server_socket.recv_multipart()
                 """The first part of all messages must be 'Chord'"""
-                subsystem, *rest = message
+                assert (
+                    len(message) >= 3
+                ), "Chord subsystem expects at least 3 parts in a message (id, subsystem, operation)"
+
+                id, subsystem, operation, *body = message
                 assert (
                     subsystem == CHORD_SUBSYSTEM
                 ), f"The first part of the message MUST be `{CHORD_SUBSYSTEM.decode()}` but it was received `{subsystem.decode()}`"
-
-                operation, *body = rest
 
                 response: Optional[list[bytes]] = (
                     None  # The response to the actual request
@@ -194,7 +303,7 @@ class ChordNode:
                         len(body) == 2
                     ), f"The NOTIFY operation requires 2 arguments. The IP address and Port"
                     ip = body[0]
-                    port = int.from_bytes(body[2])
+                    port = int.from_bytes(body[1])
                     node = ChordNodeReference(ip, port)
                     self.notify(node)
                 elif operation == PING:
@@ -208,7 +317,7 @@ class ChordNode:
 
                 if response:
                     # Handle how to send the response to the upper layer system
-                    pass
+                    self.server_socket.send_multipart(response)
 
             except Exception as e:
                 print(
